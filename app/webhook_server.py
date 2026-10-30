@@ -1,16 +1,14 @@
-import json
-import os
-import requests
-import logging
-from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
-from tempfile import NamedTemporaryFile
-from app.integration import process_request
-from app.webex_client import WebexClient
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import logging
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-# เพิ่มการตั้งค่า logger[cite: 26]
-log = logging.getLogger(__name__)
+from app.integration import process_request
+from app.webex_client import WEBEX_API_BASE, WebexClient
+
 
 class WebexEventHandler:
     def __init__(self, client, bot_person_id, processor=None):
@@ -19,123 +17,132 @@ class WebexEventHandler:
         self.processor = processor or process_request
 
     def handle_event(self, event):
-        # สนใจแค่ messages/created และมี messageId[cite: 25]
-        if event.get("resource") != "messages" or event.get("event") != "created": return None
+        if not isinstance(event, dict):
+            return None
+        if event.get("resource") != "messages" or event.get("event") != "created":
+            return None
+
         data = event.get("data", {})
+        if not isinstance(data, dict):
+            return None
+
         message_id = data.get("id")
-        if not message_id: return None
+        if not message_id:
+            return None
 
-        # ข้ามข้อความที่ตัวเองส่ง (เช็คจาก payload เบื้องต้น)[cite: 25]
-        if data.get("personId") == self.bot_person_id: return None
+        if data.get("personId") == self.bot_person_id:
+            return None
 
-        # โหลดข้อความจาก Webex[cite: 25]
         message = self.client.get_message(message_id)
-        
-        # เช็คอีกครั้ง ป้องกันลูปจากการตอบกลับของบอท[cite: 25]
+
         if message.get("personId") == self.bot_person_id:
             return None
 
-        room_id = message["roomId"]
-        
+        room_id = message.get("roomId")
+        mentioned_people = message.get("mentionedPeople", [])
         files = message.get("files", [])
+
         if len(files) > 1:
-            reply = {"status": "error", "result": "multiple_attachments"}
-            self.client.send_message(room_id, json.dumps(reply))
-            return reply
-            
-        attachment_path = None
-        temp_file = None
-        
-        try:
-            if len(files) == 1:
-                file_content = self.client.download_file(files[0])
-                temp_file = NamedTemporaryFile(delete=False, suffix=".yaml")
-                temp_file.write(file_content)
-                temp_file.close()
-                attachment_path = Path(temp_file.name)
+            result = {"status": "error", "result": "multiple_attachments"}
+        elif len(files) == 1:
+            file_bytes = self.client.download_file(files[0])
+            with TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir) / "request.yaml"
+                tmp_path.write_bytes(file_bytes)
+                try:
+                    result = self.processor(mentioned_people, tmp_path, self.bot_person_id)
+                finally:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+        else:
+            result = self.processor(mentioned_people, None, self.bot_person_id)
 
-            # ส่งเข้ากระบวนการประมวลผล[cite: 25]
-            result = self.processor(
-                message.get("mentionedPeople", []),
-                attachment_path,
-                self.bot_person_id
-            )
-            
-        except Exception:
-            # ลบ raise ทิ้ง และเปลี่ยนเป็นการเก็บ log พร้อมคืนค่า backend_failed[cite: 26]
-            log.exception('request failed')
-            result = {'status': 'error', 'result': 'backend_failed'}
-            
-        finally:
-            # ลบไฟล์ชั่วคราวทิ้งเสมอ[cite: 25]
-            if temp_file and os.path.exists(temp_file.name):
-                os.remove(temp_file.name)
+        if room_id and result is not None:
+            self.client.send_message(room_id, json.dumps(result))
 
-        # ส่งผลลัพธ์กลับเข้าห้อง[cite: 25]
-        self.client.send_message(room_id, json.dumps(result))
         return result
 
-def make_http_handler(submit_event):
-    # สร้างฟังก์ชันช่วยส่ง JSON
-    def send_json(handler, code, payload):
-        handler.send_response(code)
-        handler.send_header("Content-Type", "application/json")
-        handler.end_headers()
-        handler.wfile.write(json.dumps(payload).encode())
 
-    class WebhookHTTPHandler(BaseHTTPRequestHandler):
+def make_http_handler(submit_event):
+    class RequestHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            # ดัก Query String เผื่อมีการส่งพารามิเตอร์ต่อท้าย
-            if self.path.split("?")[0] == "/health":
-                send_json(self, 200, {"status": "ok", "result": "healthy"})
+            if self.path == "/health":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "result": "healthy"}).encode())
             else:
-                # แก้ไขจาก self.send_error(404) เป็นส่ง JSON
-                send_json(self, 404, {"status": "error", "result": "not_found"})
+                self.send_response(404)
+                self.end_headers()
 
         def do_POST(self):
-            if self.path.split("?")[0] == "/webhook":
+            if self.path == "/webhook":
+                length = int(self.headers.get("Content-Length", 0))
+                if length < 1 or length > 1_000_000:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "result": "invalid_event"}).encode())
+                    return
+
+                raw_body = self.rfile.read(length)
                 try:
-                    content_length = int(self.headers.get("Content-Length", 0))
-                    if not (1 <= content_length <= 1000000):
+                    event_data = json.loads(raw_body.decode("utf-8"))
+                    if not isinstance(event_data, dict):
                         raise ValueError()
-                    body = self.rfile.read(content_length)
-                    event = json.loads(body)
-                    if not isinstance(event, dict):
-                        raise ValueError()
-                        
-                    # ตอบกลับ Webex ทันทีว่ารับทราบแล้ว ด้วย JSON
-                    send_json(self, 200, {"status": "ok", "result": "accepted"})
-                    
-                    # โยนงานให้ Background Processing[cite: 25]
-                    submit_event(event)
-                    
-                except (ValueError, json.JSONDecodeError):
-                    # ส่ง error กรณี payload ผิดปกติ
-                    send_json(self, 400, {"status": "error", "result": "invalid_event"})
+                except Exception:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "result": "invalid_event"}).encode())
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "result": "accepted"}).encode())
+
+                submit_event(event_data)
             else:
-                # แก้ไขจาก self.send_error(404) เป็นส่ง JSON
-                send_json(self, 404, {"status": "error", "result": "not_found"})
-                
-    return WebhookHTTPHandler
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    return RequestHandler
+
 
 def main():
-    logging.basicConfig(level=logging.INFO)
-    port = int(os.environ.get("WEBHOOK_PORT", 8000))
-    host = os.environ.get("WEBHOOK_HOST", "0.0.0.0")
-    
-    client = WebexClient()
-    bot_info = requests.get("https://webexapis.com/v1/people/me", headers=client.headers).json()
-    bot_person_id = bot_info["id"]
-    
+    env_file = Path(".env")
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+    token = os.getenv("WEBEX_BOT_TOKEN")
+    client = WebexClient(token=token)
+
+    resp = client.session.get(f"{WEBEX_API_BASE}/people/me", headers=client.headers, timeout=10)
+    resp.raise_for_status()
+    bot_person_id = resp.json().get("id")
+
     handler = WebexEventHandler(client, bot_person_id)
+
     executor = ThreadPoolExecutor(max_workers=1)
-    
-    def submit_event(event):
-        executor.submit(handler.handle_event, event)
-        
-    server_class = make_http_handler(submit_event)
-    server = ThreadingHTTPServer((host, port), server_class)
-    server.serve_forever()
+
+    host = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+    port = int(os.getenv("WEBHOOK_PORT", 8000))
+
+    server = ThreadingHTTPServer((host, port), make_http_handler(lambda ev: executor.submit(handler.handle_event, ev)))
+    print(f"Webhook server started at http://{host}:{port}")
+    try:
+        server.serve_forever()
+    finally:
+        executor.shutdown(wait=True)
+
 
 if __name__ == "__main__":
     main()
