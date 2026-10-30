@@ -1,0 +1,13 @@
+fixture: 07-update-ip-desc.yaml
+
+expected:
+  status: ok
+  result: planned
+  operation: update
+  changes:
+    ipv4:
+      from: 172.23.200.1/32
+      to: 172.23.88.1/32
+    description:
+      from: OLD-DESCRIPTION
+      to: IPA2026-66070123
